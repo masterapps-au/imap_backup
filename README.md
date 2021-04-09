@@ -45,18 +45,14 @@ It has the following features:
         ],
     "accounts": [
         {
-            "username": "john@microsoft.com",
-            "password": "password1", 
             "email": "john@microsoft.com",
+            "password": "password1", 
             "host": "outlook.office365.com",
-            "ssl": true,  
             "processes_per_account": 1
         },
-        {
-            "username": "jill@microsoft.com", 
-            "password": "password2", 
+        { 
             "email": "jill@microsoft.com",
-            "ssl": true, 
+            "password": "password2", 
             "host": "outlook.office365.com"
         }
     ]
@@ -95,7 +91,7 @@ run successfully.
 
 `accounts.host` - The IMAP host.
 
-`accounts.ssl` - Whether to connect to the host over SSL. Default false.
+`accounts.ssl` - Whether to connect to the host over SSL. Default true.
 
 `accounts.processes_per_account` - An override that reduces the maximum number of connections that 
 are allowed to this IMAP host. Default `processes_per_account`.
@@ -105,6 +101,58 @@ are allowed to this IMAP host. Default `processes_per_account`.
 `python imap_backup.py`
 
 Or add it to your cron and enjoy daily/weekly/monthly IMAP backups.
+
+
+## Connecting via OAuth2
+
+If your provider only supports OAuth authentication, then you can specify connection details in
+the `oauth2` section of config.json. Currently only Office 365 is supported.
+
+### Office 365
+
+Ask your Office 365 administrator to add a new App Registration with the following settings, and to
+provide you with the corresponding Client ID and Tenant ID of the application.
+
+API Permissions (With admin consent granted):
+- IMAP.AccessAsUser.All
+- offline_access
+
+Redirect URI:
+- https://login.microsoftonline.com/common/oauth2/nativeclient
+
+Then update config.json similar to below:
+
+```
+{
+    "oauth2": {
+       "john": {
+          "type": "o365",
+          "client_id": "YOUR-CLIENT-ID-HERE",
+          "tenant_id": "YOUR-TENANT-ID-HERE",
+          "email": "john@microsoft.com"
+        },
+        "jill": {
+          "type": "o365",
+          "client_id": "YOUR-CLIENT-ID-HERE",
+          "tenant_id": "YOUR-TENANT-ID-HERE",
+          "email": "jill@microsoft.com"
+        }
+    },
+    "accounts": [
+        {
+            "email": "john@microsoft.com",
+            "oauth2": "john", 
+            "host": "outlook.office365.com",
+            "processes_per_account": 1
+        },
+        { 
+            "email": "jill@microsoft.com",
+            "oauth2": "jill", 
+            "host": "outlook.office365.com"
+        }
+    ]  
+}
+```
 
 
 ## License

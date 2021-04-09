@@ -15,20 +15,16 @@
         "Working Set"
         ],
     "accounts": [
-        {
-            "username": "john@microsoft.com", 
-            "ssl": true, 
-            "host": "outlook.office365.com", 
-            "password": "password1", 
+        { 
             "email": "john@microsoft.com",
+            "password": "password1", 
+            "host": "outlook.office365.com", 
             "processes_per_account": 1
         },
         {
-            "username": "jill@microsoft.com", 
-            "ssl": true, 
-            "host": "outlook.office365.com", 
-            "password": "password2", 
-            "email": "jill@microsoft.com"
+            "email": "jill@microsoft.com",
+            "password": "password2",
+            "host": "outlook.office365.com" 
         }
     ]
 }
