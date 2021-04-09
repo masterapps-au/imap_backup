@@ -23,8 +23,11 @@ import sys
 import time
 import traceback
 import urllib2
+from urlparse import parse_qs, urlparse
+import uuid
 
 
+SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
 UID_RE = re.compile(br'UID (\d+)')
 SPACE_RE = re.compile(br'\s+', re.MULTILINE)
 MESSAGE_ID_RE = re.compile(br"^Message\-ID\: (.+)", re.IGNORECASE + re.MULTILINE)
@@ -65,8 +68,9 @@ class IMAPConnection(object):
     """
     Wraps an imaplib connection and allows for handling dropped connections and throttling.
     """
-    def __init__(self, config, account):
+    def __init__(self, config, oauth_tokens, account):
         self.config = config
+        self.oauth_tokens = oauth_tokens
         self.account = account
         self.mailbox_name = None
         self.imap = None
@@ -92,7 +96,7 @@ class IMAPConnection(object):
             self.account['email'], self.mailbox_name or ALL_MAILBOXES, self.account['host']))
         
         try:
-            if self.account.get('ssl'):
+            if self.account.get('ssl', True):
                 self.imap = imaplib.IMAP4_SSL(self.account['host'], 
                     port=self.account.get('port', imaplib.IMAP4_SSL_PORT),
                     keyfile=self.account.get('keyfile'), 
@@ -101,8 +105,15 @@ class IMAPConnection(object):
                 self.imap = imaplib.IMAP4(self.account['host'], 
                     port=self.account.get('port', imaplib.IMAP4_PORT))
             
-            self.call(lambda imap: imap.login(self.account.get('username', self.account['email']), 
-                self.account['password']), reconnect=False)
+            if self.account.get('oauth2'):
+                oauth2_string = b'user=%s\1auth=Bearer %s\1\1' % (
+                    str(self.account.get('username', self.account['email'])), 
+                    str(self.oauth_tokens[self.account['oauth2']]))
+                self.call(lambda imap: imap.authenticate('XOAUTH2', lambda x: oauth2_string), 
+                    reconnect=False)
+            else:
+                self.call(lambda imap: imap.login(self.account.get('username', self.account['email']), 
+                    self.account['password']), reconnect=False)
             
         except Exception as e:
             logger.error('%s/%s: Failed to connect to server: %s' % (
@@ -377,12 +388,12 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
                     f.write(X_MOZILLA_STATUS_DELETED)
 
 
-def backup_mailbox_worker(config, account, mailbox_queue):
+def backup_mailbox_worker(config, oauth_tokens, account, mailbox_queue):
     """
     Worker process for backing up the mailboxes in the mailbox queue for the given account.
     """
     try:
-        with IMAPConnection(config, account) as conn:
+        with IMAPConnection(config, oauth_tokens, account) as conn:
             try:
                 conn.connect()
             except Exception:
@@ -404,12 +415,12 @@ def backup_mailbox_worker(config, account, mailbox_queue):
 #
 # Main functions
 #
-def get_account_mailboxes(config, account):
+def get_account_mailboxes(config, oauth_tokens, account):
     """
     Returns the mailboxes and their mbox paths to backup for a given account.
     """    
     # connect to the IMAP server for this account
-    with IMAPConnection(config, account) as conn:
+    with IMAPConnection(config, oauth_tokens, account) as conn:
         try:
             conn.connect()
         except Exception:
@@ -453,6 +464,70 @@ def get_account_mailboxes(config, account):
     return mailboxes
 
 
+def authenticate_oauth2_tokens(config):
+    """
+    Authenticates with various OAuth2 providers and return their access tokens by connection name.
+    """
+    tokens = {}
+    cache_path = config.get('oauth2_cache', SCRIPT_DIR)
+    
+    for name, conn in config.get('oauth2', {}).items():
+        if conn['type'] == 'o365':
+            try:
+                import msal
+            except ImportError:
+                logger.error('Failed to import msal library required to connect to Office 365. '
+                    'Install via "pip install msal" before trying again.')
+                return None
+            
+            authority = "https://login.microsoftonline.com/" + conn['tenant_id']
+            scopes = ["https://outlook.office.com/IMAP.AccessAsUser.All"]
+            cache = msal.SerializableTokenCache()
+            
+            cache_file = os.path.join(cache_path, 'oauth2_o365_' + name + '.json')
+            if os.path.exists(cache_file):
+                with open(cache_file, 'rb') as f:
+                    cache.deserialize(f.read())
+            
+            app = msal.PublicClientApplication(conn['client_id'], 
+                authority=authority, 
+                token_cache=cache)
+            
+            accounts = app.get_accounts()
+            result = app.acquire_token_silent(scopes, account=accounts[0]) if accounts else None
+            
+            if result is None:
+                logger.info('%s: Connecting to Office 365 Oauth (%s)...' % (
+                    conn['email'], conn['tenant_id']))
+                
+                state = str(uuid.uuid4())
+                redirect_uri = 'https://login.microsoftonline.com/common/oauth2/nativeclient'
+                auth_url = app.get_authorization_request_url(scopes, state=state, 
+                    redirect_uri=redirect_uri, login_hint=conn.get('email'))
+                
+                print('1. Open the following URL in your browser:')
+                print(auth_url)
+                print('2. Sign in to Office 365.')
+                result_url = raw_input('3. You will be redirected to an empty page. '
+                    'Paste the page URL here: ')
+                
+                auth_code = parse_qs(urlparse(result_url).query)['code'][0]
+                result = app.acquire_token_by_authorization_code(auth_code, scopes=scopes, 
+                    redirect_uri=redirect_uri)
+            
+            tokens[name] = result['access_token']
+            
+            with open(cache_file, 'wb') as f:
+                f.write(cache.serialize())
+                        
+        else:
+            logger.error('Unknown oauth2 type of: %s. Specify one of: o365' % 
+                conn['type'])
+            return None
+    
+    return tokens
+
+
 def main():
     """
     Runs the backup.
@@ -469,17 +544,22 @@ def main():
     with open(config_path, 'rb') as f: 
         config = json.load(f)
     
+    # authenticate any oauth tokens first
+    oauth_tokens = authenticate_oauth2_tokens(config)
+    if oauth_tokens is None:
+        return 1
+    
     # find all mailboxes for all mail accounts and create a N number of processes per account
     processes_per_account = config.get('processes_per_account', 2)
     pending_processes = []
     
     for account in config['accounts']:
         mailbox_queue = multiprocessing.Queue()
-        for m in get_account_mailboxes(config, account):
+        for m in get_account_mailboxes(config, oauth_tokens, account):
             mailbox_queue.put(m)
         for _ in range(account.get('processes_per_account', processes_per_account)):
             pending_processes.append(multiprocessing.Process(target=backup_mailbox_worker, 
-                args=(config, account, mailbox_queue)))
+                args=(config, oauth_tokens, account, mailbox_queue)))
     
     pending_processes.reverse()
     
