@@ -10,6 +10,7 @@ from __future__ import absolute_import, unicode_literals
 
 import hashlib
 import imaplib
+from io import BytesIO
 import itertools
 import json
 import logging
@@ -18,6 +19,7 @@ import multiprocessing
 import os.path
 import Queue
 import re
+import rfc822
 import socket
 import sys
 import time
@@ -229,6 +231,7 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
     # load the mbox from disk if it exists and determine the Message-ID's already stored
     parse_message_id_header = lambda message_id: (lambda m: m.group(1) if m else None)(
         MESSAGE_ID_RE.match(SPACE_RE.sub(b' ', message_id.strip())))
+    mbox_message_ids = set()
     local_message_ids = set()
     
     if os.path.exists(mbox_path):
@@ -238,11 +241,12 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
         with open(mbox_path, 'rb') as f:
             for msg in mailbox.PortableUnixMailbox(f):
                 x_mozilla_status = b''.join(msg.getfirstmatchingheader('X-Mozilla-Status'))
-                if x_mozilla_status == X_MOZILLA_STATUS_DELETED:
-                    continue
                 message_id = parse_message_id_header(
                     b''.join(msg.getfirstmatchingheader('Message-ID')))
-                local_message_ids.add(message_id)
+                
+                mbox_message_ids.add(message_id)
+                if x_mozilla_status != X_MOZILLA_STATUS_DELETED:
+                    local_message_ids.add(message_id)
     
     # select the mailbox
     try:
@@ -289,7 +293,7 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
                 uids_without_message_ids.append(uid)
             else:
                 remote_message_ids.add(message_id)
-                if message_id not in local_message_ids:
+                if message_id not in mbox_message_ids:
                     uids_to_download.append(uid)
     
     # handle messages that don't have a Message-ID by generating one from specific headers
@@ -313,10 +317,8 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
                 IMAPBACKUP_DOMAIN)
             
             remote_message_ids.add(message_id)
-            if message_id not in local_message_ids:
+            if message_id not in mbox_message_ids:
                 uids_to_download_without_message_ids.append((uid, message_id))
-    
-    deleted_message_ids = local_message_ids - remote_message_ids
     
     # download new messages to the mailbox
     prepare_body_for_mbox = lambda body: \
@@ -339,6 +341,19 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
                     continue
                 
                 for (unused, body), unused in grouper(2, data):
+                    msg = rfc822.Message(BytesIO(body))
+                    message_id = parse_message_id_header(
+                        b''.join(msg.getfirstmatchingheader('Message-ID')))
+                    
+                    if message_id in mbox_message_ids:
+                        # avoid writing duplicates to mbox, can happen when moved between folders
+                        logger.warn('%s/%s: Attempted to write email with duplicate '
+                            'Message-ID %s to mbox. Skipping...' % (
+                                account['email'], mailbox_name, message_id))
+                        continue
+                    local_message_ids.add(message_id)
+                    mbox_message_ids.add(message_id)
+                    
                     f.write(b''.join([
                         b'From nobody %s\n' % time.ctime(),
                         X_MOZILLA_STATUS_READ,
@@ -359,6 +374,9 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
                         account['email'], mailbox_name, e))
                     continue
                 
+                local_message_ids.add(message_id)
+                mbox_message_ids.add(message_id)
+                
                 f.write(b''.join([
                     b'From nobody %s\n' % time.ctime(),
                     X_MOZILLA_STATUS_READ,
@@ -368,24 +386,42 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
                     ]))
     
     # set deleted messages to X-Mozilla-Status: 0009 by overwriting the header in-place
-    if deleted_message_ids:
-        logger.info('%s/%s: Deleting %s emails...' % (
-            account['email'], mailbox_name, len(deleted_message_ids)))        
+    # set restored messages to X-Mozilla-Status: 0001 by overwriting the header in-place
+    deleted_message_ids = local_message_ids - remote_message_ids
+    restored_message_ids = (mbox_message_ids - local_message_ids) & remote_message_ids
+    
+    if deleted_message_ids or restored_message_ids:
+        logger.info('%s/%s: Deleting %s emails and restoring %s emails...' % (
+            account['email'], mailbox_name, len(deleted_message_ids), len(restored_message_ids)))
         
         with open(mbox_path, 'r+b') as f:
             for msg in mailbox.PortableUnixMailbox(f):
                 message_id = parse_message_id_header(
                     b''.join(msg.getfirstmatchingheader('Message-ID')))
                 
-                if message_id in deleted_message_ids:
+                is_deleted = message_id in deleted_message_ids
+                is_restored = message_id in restored_message_ids
+                
+                if is_deleted or is_restored:
                     msg.fp.seek(len(msg.unixfrom))
                     offset = f.tell()
                     x_mozilla_status = f.read(len(X_MOZILLA_STATUS_READ))
-                    assert x_mozilla_status == X_MOZILLA_STATUS_READ, \
-                        '%s[%s]: expected %s at offset %s, found %s' % (mbox_path, message_id, 
-                            repr(X_MOZILLA_STATUS_READ), offset, repr(x_mozilla_status))
+                    
+                    if is_deleted:
+                        assert x_mozilla_status == X_MOZILLA_STATUS_READ, \
+                            '%s[%s]: expected %s at offset %s, found %s' % (mbox_path, message_id, 
+                                repr(X_MOZILLA_STATUS_READ), offset, repr(x_mozilla_status))
+                    else:
+                        assert x_mozilla_status == X_MOZILLA_STATUS_DELETED, \
+                            '%s[%s]: expected %s at offset %s, found %s' % (mbox_path, message_id, 
+                                repr(X_MOZILLA_STATUS_DELETED), offset, repr(x_mozilla_status))
+                    
                     msg.fp.seek(len(msg.unixfrom))
-                    f.write(X_MOZILLA_STATUS_DELETED)
+                    
+                    if is_deleted:
+                        f.write(X_MOZILLA_STATUS_DELETED)
+                    else:
+                        f.write(X_MOZILLA_STATUS_READ)
 
 
 def backup_mailbox_worker(config, oauth_tokens, account, mailbox_queue):
