@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 
 """
 imap_backup
@@ -218,6 +218,13 @@ class IMAPConnection(object):
         if not all(len(v) == 2 and len(v[0]) == 2 for v in grouper(2, dat)):
             raise ValueError('Malformed response: %s' % repr(dat))
         
+        # normalise the data to a list of (UID, result) tuples
+        # NOTE: the UID can be listed in part a or b depending on the server
+        dat = [
+            (UID_RE.search(b' '.join([a, b])).group(1), result)
+            for (a, result), b in grouper(2, dat)
+            ]
+        
         return typ, dat
 
 
@@ -279,15 +286,13 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
         
         try:
             data = conn.uid_fetch(uid_chunk, 
-                b'(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)] UID)')[1]
+                b'(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])')[1]
         except Exception as e:
             logger.error('%s/%s: Failed to retrieve Message-IDs: %s' % (
                 account['email'], mailbox_name, e))
             continue
         
-        for (unused, message_id), uid in grouper(2, data):
-            uid = UID_RE.search(uid).group(1)
-            
+        for uid, message_id in data:
             message_id = parse_message_id_header(message_id)
             if not message_id:
                 uids_without_message_ids.append(uid)
@@ -305,14 +310,13 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
         
         try:
             data = conn.uid_fetch(uid_chunk, 
-                b'(BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)] UID)')[1]
+                b'(BODY.PEEK[HEADER.FIELDS (FROM TO CC DATE SUBJECT)])')[1]
         except Exception as e:
             logger.error('%s/%s: Failed to retrieve headers: %s' % (
                 account['email'], mailbox_name, e))
             continue
         
-        for (unused, headers), uid in grouper(2, data):
-            uid = UID_RE.search(uid).group(1)
+        for uid, headers in data:
             message_id = b'<%s@%s>' % (hashlib.sha1(headers.strip()).hexdigest(), 
                 IMAPBACKUP_DOMAIN)
             
@@ -340,7 +344,7 @@ def backup_mailbox(conn, config, account, mailbox_name, mbox_path):
                         account['email'], mailbox_name, e))
                     continue
                 
-                for (unused, body), unused in grouper(2, data):
+                for unused, body in data:
                     msg = rfc822.Message(BytesIO(body))
                     message_id = parse_message_id_header(
                         b''.join(msg.getfirstmatchingheader('Message-ID')))
